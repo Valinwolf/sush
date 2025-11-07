@@ -1,28 +1,17 @@
 #!/usr/bin/python3
-#### Switch User SHell (SUSH) version 2.1-alpha
-#### Python-Curses login shell that has the sole purpose to switch users
-####   v2.1-alpha
-####     - added config file
-####     - added auto-detect install prefix
-####         - files can be installed anywhere now
-####         - config: $INSTALL_PREFIX/etc/sush.env
-####         - main script: $INSTALL_PREFIX/bin/sush
-####         - askpass script: $INSTALL_PREFIX/bin/sush-askpass
-####   v2.0-alpha
-####     - tmux session manager added
-####     - all shells are opened in a tmux session
-####   v1.0-alpha
-####     - initial version
+import curses, subprocess, time, string, pwd, sys, os, socket, urllib.request, urllib.parse, json, tempfile, stat
 
-import curses, subprocess, time, string, pwd, sys, os, socket
+VERSION = "2.2-alpha"
 
 MENU_ITEMS = ["Primary Shell", "Secondary Shell", "Login", "Disconnect"]
 PAIR_TITLE_BLUE, PAIR_WARN_RED, PAIR_RED_BG, PAIR_WHITE_ON_BLUE = 1,2,3,4
 
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+SCRIPT_PATH = os.path.realpath(__file__)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
 INSTALL_PREFIX = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 ASKPASS_PATH = os.path.join(INSTALL_PREFIX, "bin", "sush-askpass")
-CONFIG_PATH = os.path.join(INSTALL_PREFIX, "etc", "sush.env")
+CONFIG_PATH = os.path.join(INSTALL_PREFIX, "etc", "sush", "env")
+FILES_TXT_PATH = os.path.join(INSTALL_PREFIX, "etc", "sush", "files.txt")
 
 def _load_env_config():
     env = {}
@@ -33,8 +22,7 @@ def _load_env_config():
                 if not line or line.startswith("#"): continue
                 if "=" not in line: continue
                 k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip()
+                k = k.strip(); v = v.strip()
                 if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                     v = v[1:-1]
                 env[k] = v
@@ -44,6 +32,7 @@ def _load_env_config():
 
 _cfg = _load_env_config()
 PROMPT_OVERRIDE = _cfg.get("PROMPT_OVERRIDE", r"\[\033[1;31m\][SECURE] \[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ")
+UPDATE_URL = _cfg.get("UPDATE_URL", "https://github.com/Valinwolf/sush")
 
 _HOSTNAME = socket.gethostname()
 
@@ -73,17 +62,13 @@ def safe_addstr(win, y, x, s, attr=0):
         h, w = win.getmaxyx()
     except Exception:
         return
-    if y < 0 or y >= h:
-        return
+    if y < 0 or y >= h: return
     if x < 0:
         s = s[-x:]; x = 0
-    if x >= w:
-        return
+    if x >= w: return
     try:
-        if attr:
-            win.addstr(y, x, s[: max(0, w - x)], attr)
-        else:
-            win.addstr(y, x, s[: max(0, w - x)])
+        if attr: win.addstr(y, x, s[: max(0, w - x)], attr)
+        else: win.addstr(y, x, s[: max(0, w - x)])
     except curses.error:
         pass
 
@@ -184,25 +169,25 @@ def login_dialog(stdscr):
             ch = chr(k)
             if ch in allowed: username += ch
 
+def _sudo_env(base=None):
+    env = os.environ.copy()
+    env["SUDO_ASKPASS"] = ASKPASS_PATH
+    try: env["SUSH_TTY"] = os.ttyname(0)
+    except Exception: env["SUSH_TTY"] = "/dev/tty"
+    if base: env.update(base)
+    return env
+
 def _tmux_run(login_user, args, env=None):
-    env2 = os.environ.copy()
-    if env: env2.update(env)
+    env2 = _sudo_env(env)
     if login_user:
-        env2["SUDO_ASKPASS"] = ASKPASS_PATH
-        try: env2["SUSH_TTY"] = os.ttyname(0)
-        except Exception: env2["SUSH_TTY"] = "/dev/tty"
         return subprocess.call(["sudo", "-A", "-H", "-iu", login_user, "tmux"] + args, env=env2)
     else:
-        return subprocess.call(["tmux"] + args, env=env2)
+        return subprocess.call(["tmux"] + args, env=os.environ.copy())
 
 def _tmux_output(login_user, args):
     try:
         if login_user:
-            env = os.environ.copy()
-            env["SUDO_ASKPASS"] = ASKPASS_PATH
-            try: env["SUSH_TTY"] = os.ttyname(0)
-            except Exception: env["SUSH_TTY"] = "/dev/tty"
-            return subprocess.check_output(["sudo", "-A", "-H", "-iu", login_user, "tmux"] + args, stderr=subprocess.STDOUT, text=True, env=env)
+            return subprocess.check_output(["sudo", "-A", "-H", "-iu", login_user, "tmux"] + args, stderr=subprocess.STDOUT, text=True, env=_sudo_env())
         else:
             return subprocess.check_output(["tmux"] + args, stderr=subprocess.STDOUT, text=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -261,11 +246,7 @@ def _fmt_created(epoch):
     return time.strftime("%d %b %H:%M", t)
 
 def tmux_session_manager(stdscr, login_user=None):
-    focus_area = "list"
-    sel_idx = 0
-    btn_side = 1
-    btn_idx = 0
-    scroll = 0
+    focus_area = "list"; sel_idx = 0; btn_side = 1; btn_idx = 0; scroll = 0
     while True:
         sessions = _tmux_list_sessions(login_user)
         count = len(sessions)
@@ -273,12 +254,10 @@ def tmux_session_manager(stdscr, login_user=None):
         stdscr.erase(); draw_header(stdscr)
         title = " Session Manager "
         safe_addstr(stdscr, 6, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
-        list_h = max(7, h - 18)
-        list_w = min(w - 8, 84); list_w = max(20, list_w)
+        list_h = max(7, h - 18); list_w = min(w - 8, 84); list_w = max(20, list_w)
         list_y = max(8, (h - (list_h + 10)) // 2); list_x = max(4, (w - list_w) // 2)
         max_list_bottom = h - 5
-        if list_y + list_h > max_list_bottom:
-            list_y = max(1, max_list_bottom - list_h)
+        if list_y + list_h > max_list_bottom: list_y = max(1, max_list_bottom - list_h)
         try:
             win = curses.newwin(list_h, list_w, list_y, list_x)
         except curses.error:
@@ -332,14 +311,10 @@ def tmux_session_manager(stdscr, login_user=None):
         if k in (ord('\t'), curses.KEY_BTAB):
             focus_area = "buttons" if focus_area == "list" else "list"; continue
         if focus_area == "list":
-            if k in (curses.KEY_UP, ord('k')) and count > 0:
-                sel_idx = (sel_idx - 1) % count
-            elif k in (curses.KEY_DOWN, ord('j')) and count > 0:
-                sel_idx = (sel_idx + 1) % count
-            elif k == curses.KEY_LEFT:
-                btn_side = 0
-            elif k == curses.KEY_RIGHT:
-                btn_side = 1
+            if k in (curses.KEY_UP, ord('k')) and count > 0: sel_idx = (sel_idx - 1) % count
+            elif k in (curses.KEY_DOWN, ord('j')) and count > 0: sel_idx = (sel_idx + 1) % count
+            elif k == curses.KEY_LEFT: btn_side = 0
+            elif k == curses.KEY_RIGHT: btn_side = 1
             elif k in (curses.KEY_ENTER, 10, 13):
                 if count == 0:
                     focus_area = "buttons"; btn_idx = 1
@@ -350,25 +325,19 @@ def tmux_session_manager(stdscr, login_user=None):
                         sessions2 = _tmux_list_sessions(login_user)
                         if sel_idx >= len(sessions2): sel_idx = max(0, len(sessions2) - 1)
                     else:
-                        _tmux_attach(stdscr, s["name"], login_user)
-                        return
+                        _tmux_attach(stdscr, s["name"], login_user); return
             continue
-        if k == curses.KEY_LEFT:
-            btn_idx = (btn_idx - 1) % 3
-        elif k in (curses.KEY_RIGHT, ord('\t')):
-            btn_idx = (btn_idx + 1) % 3
+        if k == curses.KEY_LEFT: btn_idx = (btn_idx - 1) % 3
+        elif k in (curses.KEY_RIGHT, ord('\t')): btn_idx = (btn_idx + 1) % 3
         elif k in (curses.KEY_ENTER, 10, 13):
-            if btn_idx == 0:
-                return
+            if btn_idx == 0: return
             elif btn_idx == 1:
                 name = _next_session_name(_tmux_list_sessions(login_user))
                 rc = _tmux_new_session(name, login_user)
                 if rc == 0:
-                    _tmux_attach(stdscr, name, login_user)
-                    return
+                    _tmux_attach(stdscr, name, login_user); return
             elif btn_idx == 2:
-                for s in _tmux_list_sessions(login_user):
-                    _tmux_kill(s["name"], login_user)
+                for s in _tmux_list_sessions(login_user): _tmux_kill(s["name"], login_user)
             continue
 
 def tmux_entry(stdscr, login_user=None):
@@ -376,8 +345,227 @@ def tmux_entry(stdscr, login_user=None):
     if not sessions:
         name = _next_session_name(sessions)
         rc = _tmux_new_session(name, login_user)
-        if rc == 0:
-            _tmux_attach(stdscr, name, login_user)
+        if rc == 0: _tmux_attach(stdscr, name, login_user)
+        return
+    tmux_session_manager(stdscr, login_user=login_user)
+
+def _http_get(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent":"sush-updater/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+def _parse_repo(update_url):
+    p = urllib.parse.urlparse(update_url)
+    parts = [x for x in p.path.split("/") if x]
+    if len(parts) < 2: return None, None
+    return parts[0], parts[1]
+
+def _latest_version_from_github(update_url):
+    try:
+        from packaging.version import Version
+    except Exception:
+        return None, None
+    owner, repo = _parse_repo(update_url)
+    if not owner: return None, None
+    api_base = f"https://api.github.com/repos/{owner}/{repo}"
+    try:
+        data = json.loads(_http_get(api_base + "/releases/latest").decode("utf-8"))
+        tag = data.get("tag_name") or ""
+        if tag.startswith("v"): tag = tag[1:]
+        return Version(tag), data.get("tag_name")
+    except Exception:
+        try:
+            data = json.loads(_http_get(api_base + "/tags").decode("utf-8"))
+            tags = []
+            from packaging.version import Version
+            for t in data:
+                name = t.get("name") or ""
+                v = name[1:] if name.startswith("v") else name
+                try: tags.append((Version(v), name))
+                except Exception: continue
+            if not tags: return None, None
+            tags.sort(key=lambda x: x[0])
+            top = tags[-1]
+            return top[0], top[1]
+        except Exception:
+            return None, None
+
+def _yes_no_dialog(stdscr, title, message):
+    while True:
+        h, w = stdscr.getmaxyx()
+        dw = min(max(50, len(message)+8), max(50, w-6))
+        dh = 9
+        dx = max(0, (w - dw) // 2); dy = max(4, (h - dh) // 2)
+        stdscr.erase(); draw_header(stdscr)
+        win = curses.newwin(dh, dw, dy, dx); win.box()
+        win.attron(curses.A_BOLD); safe_addstr(win, 0, max(1, (dw-len(title))//2), f" {title} "); win.attroff(curses.A_BOLD)
+        safe_addstr(win, 3, 2, message[:dw-4])
+        btns = ["[ Yes ]","[ No ]"]; sel = 0
+        while True:
+            bx = (dw - (len(btns[0])+2+len(btns[1])))//2
+            for i,b in enumerate(btns):
+                if i==sel: safe_addstr(win, dh-3, bx, b, curses.A_REVERSE|curses.A_BOLD)
+                else: safe_addstr(win, dh-3, bx, b)
+                bx += len(b)+2
+            draw_footer(stdscr); stdscr.refresh(); win.refresh()
+            k = stdscr.getch()
+            if k == curses.KEY_RESIZE: break
+            if k in (curses.KEY_LEFT, ord('h')): sel = (sel-1)%2
+            elif k in (curses.KEY_RIGHT, ord('l')): sel = (sel+1)%2
+            elif k in (10,13): return sel==0
+            elif k in (27, ord('q')): return False
+
+def _ensure_dir(path):
+    if os.path.isdir(path): return True
+    try: os.makedirs(path, exist_ok=True); return True
+    except PermissionError:
+        env = _sudo_env()
+        subprocess.call(["sudo","-A","-H","mkdir","-p", path], env=env)
+        return os.path.isdir(path)
+
+def _owner_for_new_files():
+    try:
+        st = os.stat(SCRIPT_PATH)
+        return st.st_uid, st.st_gid, st.st_mode & 0o777
+    except Exception:
+        return os.getuid(), os.getgid(), 0o755
+
+def _chmod_chown(path, mode, uid, gid):
+    try:
+        os.chmod(path, mode)
+        os.chown(path, uid, gid)
+        return True
+    except PermissionError:
+        env = _sudo_env()
+        subprocess.call(["sudo","-A","-H","chown", f"{uid}:{gid}", path], env=env)
+        subprocess.call(["sudo","-A","-H","chmod", f"{oct(mode)[2:]}",
+                         path], env=env)
+        return True
+    except Exception:
+        return False
+
+def _sudo_mv(src, dst):
+    try:
+        os.replace(src, dst)
+        return True
+    except PermissionError:
+        env = _sudo_env()
+        return subprocess.call(["sudo","-A","-H","mv","-f", src, dst], env=env) == 0
+
+def _sudo_writefile(dst_path, data_bytes, mode, uid, gid):
+    ddir = os.path.dirname(dst_path)
+    _ensure_dir(ddir)
+    with tempfile.NamedTemporaryFile(delete=False) as tf:
+        tmp = tf.name
+        tf.write(data_bytes)
+        tf.flush()
+    ok = _sudo_mv(tmp, dst_path)
+    try:
+        if not ok:
+            os.unlink(tmp)
+    except Exception:
+        pass
+    _chmod_chown(dst_path, mode, uid, gid)
+
+def _pip_install_requirements(tmp_req_path):
+    env = _sudo_env()
+    return subprocess.call([sys.executable, "-m", "pip", "install", "-r", tmp_req_path], env=env) == 0
+
+def _download_text(url):
+    return _http_get(url).decode("utf-8")
+
+def _download_bytes(url):
+    return _http_get(url)
+
+def _compute_modes(flag_char, existing_mode=None, default_template_mode=0o755):
+    if existing_mode is not None:
+        return existing_mode & 0o777
+    base = 0o755 if flag_char == 'x' else 0o644
+    if default_template_mode and default_template_mode & 0o022:
+        base |= 0o022
+    return base
+
+def _update_install_from_tag(stdscr, update_url, tag_name):
+    owner, repo = _parse_repo(update_url)
+    if not owner: return False
+    raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{tag_name}"
+    try:
+        req_txt = None
+        try:
+            req_txt = _download_text(raw_base + "/requirements.txt")
+        except Exception:
+            req_txt = None
+        if req_txt:
+            with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+                tf.write(req_txt)
+                tf.flush()
+                _pip_install_requirements(tf.name)
+                try: os.unlink(tf.name)
+                except Exception: pass
+        files_txt = _download_text(raw_base + "/files.txt")
+        _ensure_dir(os.path.dirname(FILES_TXT_PATH))
+        _sudo_writefile(FILES_TXT_PATH, files_txt.encode("utf-8"), 0o644, *_owner_for_new_files()[:2])
+        lines = [ln.strip() for ln in files_txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        template_uid, template_gid, template_mode = _owner_for_new_files()
+        for ln in lines:
+            try:
+                flag, path = ln.split(None, 1)
+            except ValueError:
+                continue
+            flag = flag.strip()
+            rel = path.strip().lstrip("/")
+            repo_file_url = f"{raw_base}/{rel}"
+            dst_path = os.path.join(INSTALL_PREFIX, rel)
+            dst_dir = os.path.dirname(dst_path)
+            _ensure_dir(dst_dir)
+            data = _download_bytes(repo_file_url)
+            existing_uid = existing_gid = None
+            existing_mode = None
+            if os.path.exists(dst_path):
+                st = os.stat(dst_path)
+                existing_uid, existing_gid = st.st_uid, st.st_gid
+                existing_mode = st.st_mode & 0o777
+            uid = existing_uid if existing_uid is not None else template_uid
+            gid = existing_gid if existing_gid is not None else template_gid
+            mode = _compute_modes(flag[0], existing_mode, template_mode)
+            _sudo_writefile(dst_path, data, mode, uid, gid)
+        return True
+    except Exception:
+        return False
+
+def _update_check_and_prompt(stdscr):
+    try:
+        from packaging.version import Version
+    except Exception:
+        return
+    latest_ver, latest_tag = _latest_version_from_github(UPDATE_URL)
+    if not latest_ver or not latest_tag:
+        return
+    try:
+        cur = Version(VERSION)
+    except Exception:
+        return
+    if latest_ver <= cur:
+        return
+    want = _yes_no_dialog(stdscr, "Update Available", f"New version {latest_ver} found. Update now?")
+    if not want:
+        return
+    safe_addstr(stdscr, 0, 2, f"Updating to {latest_tag} ..."); stdscr.refresh()
+    ok = _update_install_from_tag(stdscr, UPDATE_URL, latest_tag)
+    if ok:
+        msg = "Update complete. Restart sush?"
+        if _yes_no_dialog(stdscr, "Update", msg):
+            curses.endwin()
+            os.execv(sys.executable, [sys.executable, SCRIPT_PATH])
+    else:
+        _yes_no_dialog(stdscr, "Update Failed", "Update failed or was incomplete. Continue anyway?")
+
+def tmux_entry(stdscr, login_user=None):
+    sessions = _tmux_list_sessions(login_user)
+    if not sessions:
+        name = _next_session_name(sessions)
+        rc = _tmux_new_session(name, login_user)
+        if rc == 0: _tmux_attach(stdscr, name, login_user)
         return
     tmux_session_manager(stdscr, login_user=login_user)
 
@@ -392,6 +580,7 @@ def main(stdscr):
         curses.init_pair(PAIR_WARN_RED, curses.COLOR_RED, -1)
         curses.init_pair(PAIR_RED_BG, curses.COLOR_BLACK, curses.COLOR_RED)
         curses.init_pair(PAIR_WHITE_ON_BLUE, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    _update_check_and_prompt(stdscr)
     sel = 0
     draw_menu(stdscr, sel)
     while True:
@@ -400,8 +589,7 @@ def main(stdscr):
             draw_menu(stdscr, sel); continue
         if k == -1:
             draw_footer(stdscr); stdscr.refresh(); continue
-        if k in (ord('q'), 27):
-            break
+        if k in (ord('q'), 27): break
         if k in (curses.KEY_UP, ord('k')):
             sel = (sel - 1) % len(MENU_ITEMS); draw_menu(stdscr, sel)
         elif k in (curses.KEY_DOWN, ord('j')):
@@ -409,8 +597,7 @@ def main(stdscr):
         elif k in (10, 13):
             choice = MENU_ITEMS[sel]
             h, w = stdscr.getmaxyx()
-            if choice == "Disconnect":
-                break
+            if choice == "Disconnect": break
             if choice == "Login":
                 action, uname = login_dialog(stdscr)
                 if action == "login":
