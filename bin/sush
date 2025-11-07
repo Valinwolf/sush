@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 import curses, subprocess, time, string, pwd, sys, os, socket, urllib.request, urllib.parse, json, tempfile
 
-VERSION = "2.3-alpha"
+VERSION = "2.3.1-alpha"
 
 PAIR_TITLE_BLUE, PAIR_WARN_RED, PAIR_RED_BG, PAIR_WHITE_ON_BLUE = 1,2,3,4
 
@@ -9,8 +9,10 @@ SCRIPT_PATH = os.path.realpath(__file__)
 SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
 INSTALL_PREFIX = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 ASKPASS_PATH = os.path.join(INSTALL_PREFIX, "bin", "sush-askpass")
-CONFIG_PATH = os.path.join(INSTALL_PREFIX, "etc", "sush", "env")
-FILES_TXT_PATH = os.path.join(INSTALL_PREFIX, "etc", "sush", "files.txt")
+CONFIG_DIR = os.path.join(INSTALL_PREFIX, "etc", "sush")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "env")
+ENV_DEFAULT_PATH = os.path.join(CONFIG_DIR, "env.default")
+FILES_TXT_PATH = os.path.join(CONFIG_DIR, "files.txt")
 
 def _load_env_config():
     env = {}
@@ -18,10 +20,13 @@ def _load_env_config():
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#"): continue
-                if "=" not in line: continue
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
                 k, v = line.split("=", 1)
-                k = k.strip(); v = v.strip()
+                k = k.strip()
+                v = v.strip()
                 if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                     v = v[1:-1]
                 env[k] = v
@@ -42,6 +47,7 @@ PRIMARY_NAME = _cfg.get("PRIMARY_NAME", "Primary Shell")
 SECONDARY_NAME = _cfg.get("SECONDARY_NAME", "Secondary Shell")
 DISABLE_PRIMARY = _cfg_bool(_cfg, "DISABLE_PRIMARY", False)
 PREVENT_ROOT_LOGIN = _cfg_bool(_cfg, "PREVENT_ROOT_LOGIN", False)
+COMPANY = _cfg.get("COMPANY", "PRIVATE COMPANY SERVER")
 if DISABLE_PRIMARY and "SECONDARY_NAME" not in _cfg:
     SECONDARY_NAME = "Open Shell"
 
@@ -82,10 +88,13 @@ def safe_addstr(win, y, x, s, attr=0):
         h, w = win.getmaxyx()
     except Exception:
         return
-    if y < 0 or y >= h: return
+    if y < 0 or y >= h:
+        return
     if x < 0:
-        s = s[-x:]; x = 0
-    if x >= w: return
+        s = s[-x:]
+        x = 0
+    if x >= w:
+        return
     try:
         if attr:
             win.addstr(y, x, s[: max(0, w - x)], attr)
@@ -96,7 +105,7 @@ def safe_addstr(win, y, x, s, attr=0):
 
 def draw_header(stdscr):
     h, w = stdscr.getmaxyx()
-    title = "Lazy Wolf Enterprises Inc."
+    title = COMPANY
     warning = "AUTHORIZED PERSONNEL ONLY"
     stdscr.attron(curses.color_pair(PAIR_TITLE_BLUE) | curses.A_BOLD)
     safe_addstr(stdscr, 1, max(0, (w - len(title)) // 2), title)
@@ -489,14 +498,57 @@ def _sudo_writefile(dst_path, data_bytes, mode, uid, gid):
         pass
     _chmod_chown(dst_path, mode, uid, gid)
 
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def _parse_env_text(txt):
+    d = {}
+    for line in txt.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s: continue
+        k, v = s.split("=", 1)
+        k = k.strip(); v = v.strip()
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1]
+        d[k] = v
+    return d
+
+def _append_new_env_keys(existing_text, new_dict, existing_dict):
+    new_lines = []
+    for k, v in new_dict.items():
+        if k not in existing_dict:
+            if v is None: v = ""
+            if any(ch in v for ch in (' ', '\t', '"', "'")):
+                line = f'{k}="{v}"'
+            else:
+                line = f"{k}={v}"
+            new_lines.append(line)
+    if not new_lines:
+        return existing_text
+    if existing_text and not existing_text.endswith("\n"):
+        existing_text += "\n"
+    return existing_text + "\n".join(new_lines) + "\n"
+
+def _prune_env_keys(existing_text, keys_to_remove):
+    keys = set(keys_to_remove)
+    out_lines = []
+    for line in existing_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            out_lines.append(line); continue
+        k = s.split("=", 1)[0].strip()
+        if k in keys:
+            continue
+        out_lines.append(line)
+    return ("\n".join(out_lines) + ("\n" if existing_text.endswith("\n") else "")) if out_lines else ""
+
 def _pip_install_requirements(tmp_req_path):
     env = _sudo_env()
     return subprocess.call([sys.executable, "-m", "pip", "install", "-r", tmp_req_path], env=env) == 0
-
-def _http_get(url, timeout=15):
-    req = urllib.request.Request(url, headers={"User-Agent":"sush-updater/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
 
 def _download_text(url):
     return _http_get(url).decode("utf-8")
@@ -514,8 +566,9 @@ def _compute_modes(flag_char, existing_mode=None, default_template_mode=0o755):
 
 def _update_install_from_tag(stdscr, update_url, tag_name):
     owner, repo = _parse_repo(update_url)
-    if not owner: return False
+    if not owner: return False, []
     raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{tag_name}"
+    removed_keys_pending = []
     try:
         req_txt = None
         try:
@@ -546,6 +599,21 @@ def _update_install_from_tag(stdscr, update_url, tag_name):
             dst_dir = os.path.dirname(dst_path)
             _ensure_dir(dst_dir)
             data = _download_bytes(repo_file_url)
+            if rel == "etc/sush/env":
+                default_txt = data.decode("utf-8", errors="replace")
+                _sudo_writefile(ENV_DEFAULT_PATH, default_txt.encode("utf-8"), 0o644, *_owner_for_new_files()[:2])
+                current_txt = _read_text(CONFIG_PATH)
+                if not current_txt:
+                    _sudo_writefile(CONFIG_PATH, default_txt.encode("utf-8"), 0o644, *_owner_for_new_files()[:2])
+                else:
+                    default_dict = _parse_env_text(default_txt)
+                    existing_dict = _parse_env_text(current_txt)
+                    updated_txt = _append_new_env_keys(current_txt, default_dict, existing_dict)
+                    _sudo_writefile(CONFIG_PATH, updated_txt.encode("utf-8"), 0o644, *_owner_for_new_files()[:2])
+                    removed_keys = [k for k in existing_dict.keys() if k not in default_dict]
+                    if removed_keys:
+                        removed_keys_pending.extend(removed_keys)
+                continue
             existing_uid = existing_gid = None
             existing_mode = None
             if os.path.exists(dst_path):
@@ -556,9 +624,9 @@ def _update_install_from_tag(stdscr, update_url, tag_name):
             gid = existing_gid if existing_gid is not None else template_gid
             mode = _compute_modes(flag[0], existing_mode, template_mode)
             _sudo_writefile(dst_path, data, mode, uid, gid)
-        return True
+        return True, removed_keys_pending
     except Exception:
-        return False
+        return False, []
 
 def _update_check_and_prompt(stdscr):
     try:
@@ -580,23 +648,21 @@ def _update_check_and_prompt(stdscr):
     curses.endwin()
     print(f"\n[sush] Updating to {latest_tag} ...\n")
     sys.stdout.flush()
-    ok = _update_install_from_tag(None, UPDATE_URL, latest_tag)
-    stdscr.clear()
-    curses.doupdate()
+    ok, removed_keys = _update_install_from_tag(None, UPDATE_URL, latest_tag)
+    stdscr.clear(); curses.doupdate()
+    if ok and removed_keys:
+        listed = ", ".join(sorted(set(removed_keys)))
+        msg = f"Removed options found in your env: {listed}. Remove them?"
+        choice = _yes_no_dialog(stdscr, "Config Cleanup", msg)
+        if choice:
+            current_txt = _read_text(CONFIG_PATH)
+            new_txt = _prune_env_keys(current_txt, removed_keys)
+            _sudo_writefile(CONFIG_PATH, new_txt.encode("utf-8"), 0o644, *_owner_for_new_files()[:2])
     msg = "Update complete. Restart sush?" if ok else "Update failed or incomplete. Continue anyway?"
     choice = _yes_no_dialog(stdscr, "Update", msg)
     if ok and choice:
         curses.endwin()
         os.execv(sys.executable, [sys.executable, SCRIPT_PATH])
-
-def tmux_entry(stdscr, login_user=None):
-    sessions = _tmux_list_sessions(login_user)
-    if not sessions:
-        name = _next_session_name(sessions)
-        rc = _tmux_new_session(name, login_user)
-        if rc == 0: _tmux_attach(stdscr, name, login_user)
-        return
-    tmux_session_manager(stdscr, login_user=login_user)
 
 def main(stdscr):
     curses.curs_set(0); stdscr.keypad(True); curses.noecho(); curses.cbreak()
