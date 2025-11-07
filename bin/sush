@@ -1,7 +1,7 @@
 #!/usr/bin/python3
-import curses, subprocess, time, string, pwd, sys, os, socket, urllib.request, urllib.parse, json, tempfile, stat
+import curses, subprocess, time, string, pwd, sys, os, socket, urllib.request, urllib.parse, json, tempfile
 
-VERSION = "2.2-alpha"
+VERSION = "2.2.1-alpha"
 
 MENU_ITEMS = ["Primary Shell", "Secondary Shell", "Login", "Disconnect"]
 PAIR_TITLE_BLUE, PAIR_WARN_RED, PAIR_RED_BG, PAIR_WHITE_ON_BLUE = 1,2,3,4
@@ -67,8 +67,10 @@ def safe_addstr(win, y, x, s, attr=0):
         s = s[-x:]; x = 0
     if x >= w: return
     try:
-        if attr: win.addstr(y, x, s[: max(0, w - x)], attr)
-        else: win.addstr(y, x, s[: max(0, w - x)])
+        if attr:
+            win.addstr(y, x, s[: max(0, w - x)], attr)
+        else:
+            win.addstr(y, x, s[: max(0, w - x)])
     except curses.error:
         pass
 
@@ -438,8 +440,7 @@ def _chmod_chown(path, mode, uid, gid):
     except PermissionError:
         env = _sudo_env()
         subprocess.call(["sudo","-A","-H","chown", f"{uid}:{gid}", path], env=env)
-        subprocess.call(["sudo","-A","-H","chmod", f"{oct(mode)[2:]}",
-                         path], env=env)
+        subprocess.call(["sudo","-A","-H","chmod", f"{oct(mode)[2:]}", path], env=env)
         return True
     except Exception:
         return False
@@ -550,15 +551,17 @@ def _update_check_and_prompt(stdscr):
     want = _yes_no_dialog(stdscr, "Update Available", f"New version {latest_ver} found. Update now?")
     if not want:
         return
-    safe_addstr(stdscr, 0, 2, f"Updating to {latest_tag} ..."); stdscr.refresh()
-    ok = _update_install_from_tag(stdscr, UPDATE_URL, latest_tag)
-    if ok:
-        msg = "Update complete. Restart sush?"
-        if _yes_no_dialog(stdscr, "Update", msg):
-            curses.endwin()
-            os.execv(sys.executable, [sys.executable, SCRIPT_PATH])
-    else:
-        _yes_no_dialog(stdscr, "Update Failed", "Update failed or was incomplete. Continue anyway?")
+    curses.endwin()
+    print(f"\n[sush] Updating to {latest_tag} ...\n")
+    sys.stdout.flush()
+    ok = _update_install_from_tag(None, UPDATE_URL, latest_tag)
+    stdscr.clear()
+    curses.doupdate()
+    msg = "Update complete. Restart sush?" if ok else "Update failed or incomplete. Continue anyway?"
+    choice = _yes_no_dialog(stdscr, "Update", msg)
+    if ok and choice:
+        curses.endwin()
+        os.execv(sys.executable, [sys.executable, SCRIPT_PATH])
 
 def tmux_entry(stdscr, login_user=None):
     sessions = _tmux_list_sessions(login_user)
