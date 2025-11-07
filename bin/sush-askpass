@@ -1,0 +1,113 @@
+#!/usr/bin/python3
+import curses, sys, os, locale, stat
+from typing import Optional   # ✅ backward-compatible type hint
+
+locale.setlocale(locale.LC_ALL, "")
+
+def _is_tty_path(p: str) -> bool:
+    try:
+        st = os.stat(p)
+        return stat.S_ISCHR(st.st_mode) and (p.startswith("/dev/pts/") or p.startswith("/dev/tty"))
+    except Exception:
+        return False
+
+def _attach_tty(tty_path: str):
+    """
+    Attach stdin/stdout/stderr to the specified TTY so curses can draw.
+    Return a file descriptor (int) that preserves the ORIGINAL stdout
+    (sudo's pipe) so we can write the password back to sudo.
+    """
+    pw_fd = os.dup(1)  # Save original stdout (sudo reads this)
+    fd = os.open(tty_path, os.O_RDWR | os.O_CLOEXEC)
+    os.dup2(fd, 0); os.dup2(fd, 1); os.dup2(fd, 2); os.close(fd)
+    return pw_fd
+
+def _fallback_readline(pw_fd: Optional[int]):
+    """Fallback text prompt if curses can't run."""
+    sys.stderr.write("Password: "); sys.stderr.flush()
+    pw = sys.stdin.readline().rstrip("\n")
+    data = (pw + "\n").encode()
+    try:
+        if pw_fd is not None:
+            os.write(pw_fd, data); os.close(pw_fd)
+        else:
+            sys.stdout.write(pw + "\n"); sys.stdout.flush()
+    except Exception:
+        pass
+    sys.exit(0)
+
+def _prompt_password_curses(stdscr, pw_fd: int):
+    curses.curs_set(0); stdscr.keypad(True); curses.noecho(); curses.cbreak()
+    if curses.has_colors():
+        curses.start_color()
+        try: curses.use_default_colors()
+        except Exception: pass
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+
+    password = ""
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        dw, dh = max(44, w // 2), 9
+        dx, dy = (w - dw) // 2, max(2, (h - dh) // 2)
+        win = curses.newwin(dh, dw, dy, dx)
+        if curses.has_colors(): win.bkgd(' ', curses.color_pair(1))
+        win.box()
+        title = " Authentication "
+        win.attron(curses.A_BOLD); win.addstr(0, max(1, (dw - len(title)) // 2), title); win.attroff(curses.A_BOLD)
+        # Single password label + field
+        label = "Password:"
+        win.addstr(4, 2, label)
+        field_w = dw - len(label) - 6; fx, fy = len(label) + 3, 4
+        win.attron(curses.A_REVERSE)
+        win.addstr(fy, fx, " " * field_w)
+        masked = "*" * len(password)
+        win.addstr(fy, fx, masked[-field_w:])
+        win.attroff(curses.A_REVERSE)
+        hint = "Enter = Submit  •  Esc = Cancel"
+        win.addstr(dh - 2, max(2, (dw - len(hint)) // 2), hint[:dw-4])
+        stdscr.refresh(); win.refresh()
+
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE: continue
+        if key == 27:  # ESC
+            curses.endwin()
+            try: os.close(pw_fd)
+            except Exception: pass
+            sys.exit(1)
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            password = password[:-1]; continue
+        if key in (curses.KEY_ENTER, 10, 13):
+            curses.endwin()
+            try:
+                os.write(pw_fd, (password + "\n").encode())
+            finally:
+                try: os.close(pw_fd)
+                except Exception: pass
+            sys.exit(0)
+        if 0 <= key <= 255:
+            ch = chr(key)
+            if ch not in ("\n", "\r"):
+                password += ch
+
+def main():
+    tty = os.environ.get("SUSH_TTY", "")
+    pw_fd = None
+    if not _is_tty_path(tty):
+        try:
+            if sys.stdin.isatty(): tty = os.ttyname(0)
+        except Exception: pass
+        if not _is_tty_path(tty) and _is_tty_path("/dev/tty"): tty = "/dev/tty"
+    if not tty:
+        _fallback_readline(pw_fd)
+    try:
+        pw_fd = _attach_tty(tty)
+    except Exception:
+        _fallback_readline(pw_fd)
+    try:
+        curses.wrapper(_prompt_password_curses, pw_fd)
+    except curses.error:
+        _fallback_readline(pw_fd)
+
+if __name__ == "__main__":
+    main()

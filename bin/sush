@@ -1,0 +1,435 @@
+#!/usr/bin/python3
+#### Switch User SHell (SUSH) version 2.1-alpha
+#### Python-Curses login shell that has the sole purpose to switch users
+####   v2.1-alpha
+####     - added config file
+####     - added auto-detect install prefix
+####         - files can be installed anywhere now
+####         - config: $INSTALL_PREFIX/etc/sush.env
+####         - main script: $INSTALL_PREFIX/bin/sush
+####         - askpass script: $INSTALL_PREFIX/bin/sush-askpass
+####   v2.0-alpha
+####     - tmux session manager added
+####     - all shells are opened in a tmux session
+####   v1.0-alpha
+####     - initial version
+
+import curses, subprocess, time, string, pwd, sys, os, socket
+
+MENU_ITEMS = ["Primary Shell", "Secondary Shell", "Login", "Disconnect"]
+PAIR_TITLE_BLUE, PAIR_WARN_RED, PAIR_RED_BG, PAIR_WHITE_ON_BLUE = 1,2,3,4
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+INSTALL_PREFIX = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+ASKPASS_PATH = os.path.join(INSTALL_PREFIX, "bin", "sush-askpass")
+CONFIG_PATH = os.path.join(INSTALL_PREFIX, "etc", "sush.env")
+
+def _load_env_config():
+    env = {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"): continue
+                if "=" not in line: continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                env[k] = v
+    except Exception:
+        pass
+    return env
+
+_cfg = _load_env_config()
+PROMPT_OVERRIDE = _cfg.get("PROMPT_OVERRIDE", r"\[\033[1;31m\][SECURE] \[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ ")
+
+_HOSTNAME = socket.gethostname()
+
+def _uptime_str():
+    try:
+        out = subprocess.check_output(["uptime", "-p"], stderr=subprocess.DEVNULL, text=True).strip()
+        return out if out.startswith("up ") else f"up {out}"
+    except Exception:
+        pass
+    try:
+        with open("/proc/uptime", "r") as f:
+            secs = int(float(f.read().split()[0]))
+        d, r = divmod(secs, 86400); h, r = divmod(r, 3600); m, _ = divmod(r, 60)
+        parts = []
+        if d: parts.append(f"{d}d")
+        if h: parts.append(f"{h}h")
+        parts.append(f"{m}m")
+        return "up " + " ".join(parts)
+    except Exception:
+        return "up unknown"
+
+def _clock_str():
+    return time.strftime("%H:%M:%S")
+
+def safe_addstr(win, y, x, s, attr=0):
+    try:
+        h, w = win.getmaxyx()
+    except Exception:
+        return
+    if y < 0 or y >= h:
+        return
+    if x < 0:
+        s = s[-x:]; x = 0
+    if x >= w:
+        return
+    try:
+        if attr:
+            win.addstr(y, x, s[: max(0, w - x)], attr)
+        else:
+            win.addstr(y, x, s[: max(0, w - x)])
+    except curses.error:
+        pass
+
+def draw_header(stdscr):
+    h, w = stdscr.getmaxyx()
+    title = "Lazy Wolf Enterprises Inc."
+    warning = "AUTHORIZED PERSONNEL ONLY"
+    stdscr.attron(curses.color_pair(PAIR_TITLE_BLUE) | curses.A_BOLD)
+    safe_addstr(stdscr, 1, max(0, (w - len(title)) // 2), title)
+    stdscr.attroff(curses.color_pair(PAIR_TITLE_BLUE) | curses.A_BOLD)
+    stdscr.attron(curses.color_pair(PAIR_WARN_RED) | curses.A_BOLD)
+    safe_addstr(stdscr, 3, max(0, (w - len(warning)) // 2), warning)
+    stdscr.attroff(curses.color_pair(PAIR_WARN_RED) | curses.A_BOLD)
+
+def draw_footer(stdscr):
+    h, w = stdscr.getmaxyx()
+    if h < 4: return
+    row_secure = h - 3
+    try: stdscr.move(row_secure, 0); stdscr.clrtoeol()
+    except curses.error: pass
+    sec = "SECURE"; cx = max(0, (w - len(sec)) // 2)
+    stdscr.attron(curses.color_pair(PAIR_WARN_RED) | curses.A_BOLD)
+    safe_addstr(stdscr, row_secure, cx, sec)
+    stdscr.attroff(curses.color_pair(PAIR_WARN_RED) | curses.A_BOLD)
+    try: stdscr.move(h - 2, 0); stdscr.clrtoeol()
+    except curses.error: pass
+    try: stdscr.move(h - 1, 0); stdscr.clrtoeol()
+    except curses.error: pass
+    host, clk, up = _HOSTNAME, _clock_str(), _uptime_str()
+    safe_addstr(stdscr, h - 1, 1, host)
+    safe_addstr(stdscr, h - 1, max(0, (w - len(clk)) // 2), clk)
+    safe_addstr(stdscr, h - 1, max(1, w - len(up) - 1), up)
+
+def draw_menu(stdscr, sel):
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+    draw_header(stdscr)
+    hint = "Use ↑/↓ to move • Enter to select • q/ESC to exit"
+    safe_addstr(stdscr, max(5, h // 2 - len(MENU_ITEMS) // 2 - 2), max(0, (w - len(hint)) // 2), hint)
+    mw = max(len(i) for i in MENU_ITEMS) + 6
+    sy = max(6, (h - len(MENU_ITEMS)) // 2)
+    for i, item in enumerate(MENU_ITEMS):
+        x = max(0, (w - mw) // 2)
+        text = f"  {item.center(mw - 4)}  "
+        if i == sel: stdscr.attron(curses.A_REVERSE)
+        safe_addstr(stdscr, sy + i, x, text)
+        if i == sel: stdscr.attroff(curses.A_REVERSE)
+    draw_footer(stdscr); stdscr.refresh()
+
+def unauthorized_and_exit(stdscr):
+    h, w = stdscr.getmaxyx()
+    stdscr.bkgd(' ', curses.color_pair(PAIR_RED_BG)); stdscr.erase(); stdscr.refresh()
+    msg = "UNAUTHORIZED"; bw, bh = max(28, len(msg)+6), 7
+    by, bx = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+    for _ in range(5):
+        win = curses.newwin(bh, bw, by, bx)
+        win.bkgd(' ', curses.color_pair(PAIR_WHITE_ON_BLUE)); win.box()
+        win.attron(curses.A_BOLD); safe_addstr(win, bh//2, max(1, (bw-len(msg))//2), msg); win.attroff(curses.A_BOLD)
+        win.refresh(); curses.doupdate(); curses.napms(400)
+        for r in range(bh):
+            safe_addstr(stdscr, by + r, bx, " " * bw, curses.color_pair(PAIR_RED_BG))
+        stdscr.refresh(); curses.doupdate(); curses.napms(400)
+    curses.endwin(); sys.exit(1)
+
+def is_valid_user(u):
+    try: pwd.getpwnam(u); return True
+    except KeyError: return False
+
+def login_dialog(stdscr):
+    allowed = set(string.ascii_letters + string.digits + "._-")
+    username = ""
+    while True:
+        h, w = stdscr.getmaxyx()
+        dw, dh = max(44, w // 2), 9
+        dx, dy = max(0, (w - dw) // 2), max(6, (h - dh) // 2)
+        stdscr.erase(); draw_header(stdscr)
+        win = curses.newwin(dh, dw, dy, dx); win.bkgd(' ', curses.color_pair(PAIR_WHITE_ON_BLUE)); win.box()
+        title = " Login "; win.attron(curses.A_BOLD); safe_addstr(win, 0, max(1, (dw - len(title)) // 2), title); win.attroff(curses.A_BOLD)
+        label = "Username:"; safe_addstr(win, 4, 2, label)
+        field_w = dw - len(label) - 6; fx, fy = len(label) + 3, 4
+        win.attron(curses.A_REVERSE); safe_addstr(win, fy, fx, " " * field_w)
+        disp = username[-field_w:]; safe_addstr(win, fy, fx, disp + " " * (field_w - len(disp)))
+        win.attroff(curses.A_REVERSE)
+        hint = "Enter = Submit  •  Esc = Cancel"
+        safe_addstr(win, dh - 2, max(2, (dw - len(hint)) // 2), hint[:dw-4])
+        draw_footer(stdscr); stdscr.refresh(); win.refresh()
+        k = stdscr.getch()
+        if k == curses.KEY_RESIZE: continue
+        if k == -1:
+            draw_footer(stdscr); stdscr.refresh(); continue
+        if k == 27: return ("cancel", "")
+        if k in (curses.KEY_BACKSPACE, 127, 8):
+            if username: username = username[:-1]; continue
+        if k in (curses.KEY_ENTER, 10, 13):
+            if username.strip(): return ("login", username.strip())
+            curses.flash(); continue
+        if 0 <= k <= 255 and len(username) < 64:
+            ch = chr(k)
+            if ch in allowed: username += ch
+
+def _tmux_run(login_user, args, env=None):
+    env2 = os.environ.copy()
+    if env: env2.update(env)
+    if login_user:
+        env2["SUDO_ASKPASS"] = ASKPASS_PATH
+        try: env2["SUSH_TTY"] = os.ttyname(0)
+        except Exception: env2["SUSH_TTY"] = "/dev/tty"
+        return subprocess.call(["sudo", "-A", "-H", "-iu", login_user, "tmux"] + args, env=env2)
+    else:
+        return subprocess.call(["tmux"] + args, env=env2)
+
+def _tmux_output(login_user, args):
+    try:
+        if login_user:
+            env = os.environ.copy()
+            env["SUDO_ASKPASS"] = ASKPASS_PATH
+            try: env["SUSH_TTY"] = os.ttyname(0)
+            except Exception: env["SUSH_TTY"] = "/dev/tty"
+            return subprocess.check_output(["sudo", "-A", "-H", "-iu", login_user, "tmux"] + args, stderr=subprocess.STDOUT, text=True, env=env)
+        else:
+            return subprocess.check_output(["tmux"] + args, stderr=subprocess.STDOUT, text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+def _tmux_list_sessions(login_user=None):
+    out = _tmux_output(login_user, ["list-sessions", "-F", "#{session_name} #{session_created}"])
+    sessions = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line: continue
+        parts = line.split(None, 1)
+        if len(parts) != 2: continue
+        name, created = parts
+        if not name.startswith("sush-login-"): continue
+        try: created_epoch = int(created.strip())
+        except ValueError: created_epoch = int(time.time())
+        sessions.append({"name": name, "created": created_epoch})
+    def suffix(nm):
+        try: return int(nm.split("sush-login-")[-1])
+        except Exception: return 1_000_000
+    sessions.sort(key=lambda s: (suffix(s["name"]), s["created"]))
+    return sessions
+
+def _next_session_name(existing):
+    used = set()
+    for s in existing:
+        nm = s["name"]
+        if nm.startswith("sush-login-"):
+            try: used.add(int(nm.split("sush-login-")[-1]))
+            except: pass
+    i = 1
+    while i in used: i += 1
+    return f"sush-login-{i}"
+
+def _tmux_new_session(name, login_user=None):
+    args = ["new-session", "-d", "-s", name, "--", "env", f"PS1={PROMPT_OVERRIDE}", "/bin/bash", "-l"]
+    rc = _tmux_run(login_user, args)
+    if rc == 0:
+        _tmux_run(login_user, ["set-option", "-t", name, "default-shell", "/bin/bash"])
+    return rc
+
+def _tmux_attach(stdscr, name, login_user=None):
+    curses.endwin()
+    try:
+        rc = _tmux_run(login_user, ["attach-session", "-t", name])
+        return rc
+    finally:
+        stdscr.clear(); curses.doupdate()
+
+def _tmux_kill(name, login_user=None):
+    return _tmux_run(login_user, ["kill-session", "-t", name])
+
+def _fmt_created(epoch):
+    t = time.localtime(epoch)
+    return time.strftime("%d %b %H:%M", t)
+
+def tmux_session_manager(stdscr, login_user=None):
+    focus_area = "list"
+    sel_idx = 0
+    btn_side = 1
+    btn_idx = 0
+    scroll = 0
+    while True:
+        sessions = _tmux_list_sessions(login_user)
+        count = len(sessions)
+        h, w = stdscr.getmaxyx()
+        stdscr.erase(); draw_header(stdscr)
+        title = " Session Manager "
+        safe_addstr(stdscr, 6, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+        list_h = max(7, h - 18)
+        list_w = min(w - 8, 84); list_w = max(20, list_w)
+        list_y = max(8, (h - (list_h + 10)) // 2); list_x = max(4, (w - list_w) // 2)
+        max_list_bottom = h - 5
+        if list_y + list_h > max_list_bottom:
+            list_y = max(1, max_list_bottom - list_h)
+        try:
+            win = curses.newwin(list_h, list_w, list_y, list_x)
+        except curses.error:
+            draw_footer(stdscr); stdscr.refresh()
+            k = stdscr.getch()
+            if k in (ord('q'), 27): return
+            continue
+        win.box()
+        rows = max(0, list_h - 3)
+        if sel_idx < scroll: scroll = sel_idx
+        if rows > 0 and sel_idx >= scroll + rows: scroll = sel_idx - rows + 1
+        for i in range(rows):
+            idx = scroll + i
+            if idx >= count: break
+            s = sessions[idx]
+            base = f"{s['name']} ({_fmt_created(s['created'])}) "
+            line = base + "[X] [>]"
+            y = 1 + i; x = 2
+            safe_addstr(win, y, x, line[: max(0, list_w - 4)])
+            if focus_area == "list" and idx == sel_idx:
+                pos_x = x + len(base)
+                x_btn_x = pos_x; gt_btn_x = pos_x + 4
+                try: win.chgat(y, 1, max(0, list_w - 2), curses.A_UNDERLINE)
+                except curses.error: pass
+                if btn_side == 0:
+                    safe_addstr(win, y, x_btn_x, "[X]", curses.A_REVERSE)
+                    safe_addstr(win, y, gt_btn_x, "[>]")
+                else:
+                    safe_addstr(win, y, x_btn_x, "[X]")
+                    safe_addstr(win, y, gt_btn_x, "[>]", curses.A_REVERSE)
+        hint = "Tab = switch focus • Enter = select • X = kill • > = attach"
+        safe_addstr(win, list_h - 2, max(1, (list_w - len(hint)) // 2), hint[: max(0, list_w - 2)])
+        buttons = ["[ Main Menu ]", "[ + Session ]", "[ X All ]"]
+        btn_line = "  ".join(buttons)
+        by = min(h - 4, list_y + list_h + 1)
+        start_x = max(0, (w - len(btn_line)) // 2)
+        cursor = 0
+        for i, label in enumerate(buttons):
+            x = start_x + cursor
+            if focus_area == "buttons" and i == btn_idx:
+                safe_addstr(stdscr, by, x, label, curses.A_REVERSE | curses.A_BOLD)
+            else:
+                safe_addstr(stdscr, by, x, label)
+            cursor += len(label) + 2
+        draw_footer(stdscr); stdscr.refresh(); win.refresh()
+        k = stdscr.getch()
+        if k == curses.KEY_RESIZE: continue
+        if k == -1:
+            draw_footer(stdscr); stdscr.refresh(); continue
+        if k in (ord('q'), 27): return
+        if k in (ord('\t'), curses.KEY_BTAB):
+            focus_area = "buttons" if focus_area == "list" else "list"; continue
+        if focus_area == "list":
+            if k in (curses.KEY_UP, ord('k')) and count > 0:
+                sel_idx = (sel_idx - 1) % count
+            elif k in (curses.KEY_DOWN, ord('j')) and count > 0:
+                sel_idx = (sel_idx + 1) % count
+            elif k == curses.KEY_LEFT:
+                btn_side = 0
+            elif k == curses.KEY_RIGHT:
+                btn_side = 1
+            elif k in (curses.KEY_ENTER, 10, 13):
+                if count == 0:
+                    focus_area = "buttons"; btn_idx = 1
+                else:
+                    s = sessions[sel_idx]
+                    if btn_side == 0:
+                        _tmux_kill(s["name"], login_user)
+                        sessions2 = _tmux_list_sessions(login_user)
+                        if sel_idx >= len(sessions2): sel_idx = max(0, len(sessions2) - 1)
+                    else:
+                        _tmux_attach(stdscr, s["name"], login_user)
+                        return
+            continue
+        if k == curses.KEY_LEFT:
+            btn_idx = (btn_idx - 1) % 3
+        elif k in (curses.KEY_RIGHT, ord('\t')):
+            btn_idx = (btn_idx + 1) % 3
+        elif k in (curses.KEY_ENTER, 10, 13):
+            if btn_idx == 0:
+                return
+            elif btn_idx == 1:
+                name = _next_session_name(_tmux_list_sessions(login_user))
+                rc = _tmux_new_session(name, login_user)
+                if rc == 0:
+                    _tmux_attach(stdscr, name, login_user)
+                    return
+            elif btn_idx == 2:
+                for s in _tmux_list_sessions(login_user):
+                    _tmux_kill(s["name"], login_user)
+            continue
+
+def tmux_entry(stdscr, login_user=None):
+    sessions = _tmux_list_sessions(login_user)
+    if not sessions:
+        name = _next_session_name(sessions)
+        rc = _tmux_new_session(name, login_user)
+        if rc == 0:
+            _tmux_attach(stdscr, name, login_user)
+        return
+    tmux_session_manager(stdscr, login_user=login_user)
+
+def main(stdscr):
+    curses.curs_set(0); stdscr.keypad(True); curses.noecho(); curses.cbreak()
+    stdscr.timeout(800)
+    if curses.has_colors():
+        curses.start_color()
+        try: curses.use_default_colors()
+        except: pass
+        curses.init_pair(PAIR_TITLE_BLUE, curses.COLOR_BLUE, -1)
+        curses.init_pair(PAIR_WARN_RED, curses.COLOR_RED, -1)
+        curses.init_pair(PAIR_RED_BG, curses.COLOR_BLACK, curses.COLOR_RED)
+        curses.init_pair(PAIR_WHITE_ON_BLUE, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    sel = 0
+    draw_menu(stdscr, sel)
+    while True:
+        k = stdscr.getch()
+        if k == curses.KEY_RESIZE:
+            draw_menu(stdscr, sel); continue
+        if k == -1:
+            draw_footer(stdscr); stdscr.refresh(); continue
+        if k in (ord('q'), 27):
+            break
+        if k in (curses.KEY_UP, ord('k')):
+            sel = (sel - 1) % len(MENU_ITEMS); draw_menu(stdscr, sel)
+        elif k in (curses.KEY_DOWN, ord('j')):
+            sel = (sel + 1) % len(MENU_ITEMS); draw_menu(stdscr, sel)
+        elif k in (10, 13):
+            choice = MENU_ITEMS[sel]
+            h, w = stdscr.getmaxyx()
+            if choice == "Disconnect":
+                break
+            if choice == "Login":
+                action, uname = login_dialog(stdscr)
+                if action == "login":
+                    if not is_valid_user(uname): unauthorized_and_exit(stdscr)
+                    msg = f"Managing tmux sessions for {uname}..."
+                    safe_addstr(stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
+                    draw_footer(stdscr); stdscr.refresh(); time.sleep(0.1)
+                    tmux_entry(stdscr, uname)
+                draw_menu(stdscr, sel); continue
+            if choice == "Primary Shell":
+                msg = "Managing tmux sessions for Primary Shell..."
+                safe_addstr(stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
+                draw_footer(stdscr); stdscr.refresh(); time.sleep(0.1)
+                tmux_entry(stdscr, "root"); draw_menu(stdscr, sel); continue
+            if choice == "Secondary Shell":
+                msg = "Managing tmux sessions for Secondary Shell..."
+                safe_addstr(stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
+                draw_footer(stdscr); stdscr.refresh(); time.sleep(0.1)
+                tmux_entry(stdscr, None); draw_menu(stdscr, sel); continue
+
+if __name__ == "__main__":
+    curses.wrapper(main)
