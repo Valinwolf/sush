@@ -1,0 +1,3 @@
+r /etc/sush/env
+x /bin/sush
+x /bin/sush-askpass
