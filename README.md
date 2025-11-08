@@ -16,21 +16,8 @@ I put them in `/usr/local` personally. You can put them anywhere though.
 2. Ownership: `sudo chown root:root $INSTALL_PREFIX/{etc/sush.env,bin/sush,bin/sush-askpass}`
 3. Executables: `sudo chmod a+x $INSTALL_PREFIX/bin/sush{,-askpass}`
 4. Other permissions: `sudo chmod ug+rw,o-w $INSTALL_PREFIX/{etc/sush.env,bin/sush,bin/sush-askpass}`
-5. Pick a user you want to be the sole SSH login and set the shell: `usermod -s $INSTALL_PREFIX/bin/sush $USER`
-6. Optional, but strongly recommended: Update your sshd_config to only allow that user.
+5. Install pip requirements: copy the contents of `requirements.txt` and install it with pip to the system.
+6. Pick a user you want to be the sole SSH login and set the shell: `usermod -s $INSTALL_PREFIX/bin/sush $USER`
+7. Optional, but strongly recommended: Update your sshd_config to only allow that user.
    - `sudo echo "AllowUsers $USER" >> /etc/ssh/sshd_config`
    - `sudo systemctl restart sshd`
-
-### Changelog
-####   v2.1-alpha
- - added config file
- - added auto-detect install prefix
-   - files can be installed anywhere now
-   - config: $INSTALL_PREFIX/etc/sush.env
-   - main script: $INSTALL_PREFIX/bin/sush
-   - askpass script: $INSTALL_PREFIX/bin/sush-askpass
-####   v2.0-alpha
-  - tmux session manager added
-  - all shells are opened in a tmux session
-####   v1.0-alpha
-  - initial version
