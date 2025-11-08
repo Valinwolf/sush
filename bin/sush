@@ -3,7 +3,7 @@ import curses, subprocess, time, string, pwd, sys, os, socket, urllib.request, u
 from dotenv import dotenv_values
 
 class Globals:
-    VERSION = "3.0-alpha"
+    VERSION = "3.1-alpha"
     def __init__(self):
         self.script_path = os.path.realpath(__file__)
         self.script_dir = os.path.dirname(self.script_path)
@@ -551,16 +551,28 @@ class CursesUI:
                         except KeyError: valid = False
                         if cfg.prevent_root_login and uname == "root": self.unauthorized()
                         if not valid: self.unauthorized()
-                        msg = f"Managing tmux sessions for {uname}..."
-                        self.safe_str(self.stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
-                        self.footer(); self.stdscr.refresh(); time.sleep(0.1)
-                        self.session_entry(sm, uname)
+                        result = sm.su.auth_check(uname)
+                        if result == "ok":
+                            msg = f"Managing tmux sessions for {uname}..."
+                            self.safe_str(self.stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
+                            self.footer(); self.stdscr.refresh(); time.sleep(0.1)
+                            self.session_entry(sm, uname)
+                        elif result == "badpass":
+                            self.unauthorized()
+                        else:
+                            self.menu(items, sel); continue
                     self.menu(items, sel); continue
                 if key == "primary":
-                    msg = f"Managing tmux sessions for {label}..."
-                    self.safe_str(self.stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
-                    self.footer(); self.stdscr.refresh(); time.sleep(0.1)
-                    self.session_entry(sm, "root"); self.menu(items, sel); continue
+                    result = sm.su.auth_check("root")
+                    if result == "ok":
+                        msg = f"Managing tmux sessions for {label}..."
+                        self.safe_str(self.stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
+                        self.footer(); self.stdscr.refresh(); time.sleep(0.1)
+                        self.session_entry(sm, "root"); self.menu(items, sel); continue
+                    elif result == "badpass":
+                        self.unauthorized()
+                    else:
+                        self.menu(items, sel); continue
                 if key == "secondary":
                     msg = f"Managing tmux sessions for {label}..."
                     self.safe_str(self.stdscr, h - 4, max(0, (w - len(msg)) // 2), msg)
@@ -596,6 +608,25 @@ class SwitchUser:
     def popen(self, argv, login_user=None, cwd=None, text=True):
         full = (["sudo","-A","-H","-iu", login_user] + argv) if login_user else argv
         return subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=text, cwd=cwd)
+    def status(self, argv, login_user=None):
+        p = self.popen(argv, login_user=login_user, cwd=None, text=True)
+        out_lines = []
+        for ln in p.stdout:
+            out_lines.append(ln)
+        rc = p.wait()
+        return rc, "".join(out_lines)
+    def _classify_sudo_failure(self, out_text: str):
+        s = (out_text or "").lower()
+        if ("sorry, try again" in s) or ("incorrect password attempts" in s):
+            return "badpass"
+        if ("a password is required" in s) or ("no password was provided" in s):
+            return "cancel"
+        return "unknown"
+    def auth_check(self, user: str):
+        rc, out = self.status(["true"], login_user=user)
+        if rc == 0:
+            return "ok"
+        return self._classify_sudo_failure(out)
 
 class SessionManager:
     def __init__(self, su: SwitchUser, cfg: ConfigManager):
