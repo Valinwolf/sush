@@ -3,7 +3,7 @@ import curses, subprocess, time, string, pwd, sys, os, socket, urllib.request, u
 from dotenv import dotenv_values
 
 class Globals:
-    VERSION = "3.1-alpha"
+    VERSION = "3.1.1-alpha"
     def __init__(self):
         self.script_path = os.path.realpath(__file__)
         self.script_dir = os.path.dirname(self.script_path)
@@ -303,6 +303,8 @@ class CursesUI:
                 self.safe_str(self.stdscr, by + r, bx, " " * bw, curses.color_pair(CursesUI.PAIR_RED_BG))
             self.stdscr.refresh(); curses.doupdate(); curses.napms(400)
         curses.endwin(); sys.exit(1)
+
+
     def progress_open(self, title, total_steps=10):
         self._prog = {}
         h, w = self.stdscr.getmaxyx()
@@ -315,38 +317,46 @@ class CursesUI:
         self.safe_str(win, 0, max(1, (dw - len(title) - 2) // 2), f" {title} ", curses.A_BOLD)
         log_h = dh - 5
         log_w = dw - 2
-        log_yx = (dy + 2, dx + 1)
-        bar_y = dy + dh - 3
+        log_y = dy + 2
+        log_x = dx + 1
+        log_win = curses.newwin(log_h, log_w, log_y, log_x)
         self._prog["win"] = win
-        self._prog["dy"] = dy
-        self._prog["dx"] = dx
+        self._prog["log_win"] = log_win
         self._prog["dh"] = dh
         self._prog["dw"] = dw
-        self._prog["log_h"] = log_h
-        self._prog["log_w"] = log_w
-        self._prog["log_yx"] = log_yx
-        self._prog["bar_y"] = bar_y
+        self._prog["bar_y"] = dy + dh - 3
+        self._prog["dx"] = dx
         self._prog["lines"] = []
         self._prog["total"] = max(1, int(total_steps))
         self._prog["step"] = 0
-        win.refresh(); self.footer(); self.stdscr.refresh()
-    def progress_log(self, text):
-        if not hasattr(self, "_prog"): return
-        lines = self._prog["lines"]
-        for ln in str(text).splitlines(): lines.append(ln)
-        lines = lines[-(self._prog["log_h"]):]
-        self._prog["lines"] = lines
-        y0, x0 = self._prog["log_yx"]
-        for i in range(self._prog["log_h"]):
-            row = lines[i] if i < len(lines) else ""
-            try:
-                self.stdscr.move(y0 + i, x0)
-                self.stdscr.clrtoeol()
-            except curses.error: pass
-            self.safe_str(self.stdscr, y0 + i, x0, row[: self._prog["log_w"]])
+        win.refresh()
+        log_win.refresh()
+        self.footer()
         self.stdscr.refresh()
+
+    def progress_log(self, text):
+        if not hasattr(self, "_prog"):
+            return
+        lines = self._prog["lines"]
+        for ln in str(text).splitlines():
+            lines.append(ln)
+        log_win = self._prog["log_win"]
+        h, w = log_win.getmaxyx()
+        lines = lines[-h:]
+        self._prog["lines"] = lines
+        for i in range(h):
+            try:
+                log_win.move(i, 0)
+                log_win.clrtoeol()
+            except curses.error:
+                pass
+            row = lines[i] if i < len(lines) else ""
+            self.safe_str(log_win, i, 0, row[: w])
+        log_win.refresh()
+
     def progress_set(self, step, label=""):
-        if not hasattr(self, "_prog"): return
+        if not hasattr(self, "_prog"):
+            return
         self._prog["step"] = max(0, min(step, self._prog["total"]))
         frac = self._prog["step"] / float(self._prog["total"])
         dw = self._prog["dw"]
@@ -356,17 +366,25 @@ class CursesUI:
         try:
             self.stdscr.move(by, self._prog["dx"] + 1)
             self.stdscr.clrtoeol()
-        except curses.error: pass
+        except curses.error:
+            pass
         self.safe_str(self.stdscr, by, self._prog["dx"] + 1, bar[: dw - 2])
         if label:
             self.safe_str(self.stdscr, by - 1, self._prog["dx"] + 2, f"{label}"[: dw - 4], curses.A_BOLD)
         self.stdscr.refresh()
+
     def progress_close(self):
-        if not hasattr(self, "_prog"): return
+        if not hasattr(self, "_prog"):
+            return
         try:
-            self._prog["win"].clear(); self._prog["win"].refresh()
-        except Exception: pass
+            self._prog["log_win"].clear()
+            self._prog["log_win"].refresh()
+            self._prog["win"].clear()
+            self._prog["win"].refresh()
+        except Exception:
+            pass
         delattr(self, "_prog")
+
     def prompt(self, title, prompt, initial=""):
         text = initial
         while True:
@@ -596,9 +614,13 @@ class SwitchUser:
         os.environ[self.ENV_SUDO_ASKPASS] = self.g.askpass_path
         try: os.environ[self.ENV_SUSH_TTY] = os.ttyname(0)
         except Exception: os.environ[self.ENV_SUSH_TTY] = "/dev/tty"
-    def do(self, argv, login_user=None):
-        full = (["sudo","-A","-H","-iu", login_user] + argv) if login_user else argv
-        return subprocess.call(full)
+    def do(self, argv, login_user="root"):
+        full = (["sudo", "-A", "-H", "-iu", login_user] + argv) if login_user else argv
+        p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if p.stdout:
+            for _ in p.stdout:
+                pass
+        return p.wait()
     def out(self, argv, login_user=None, text=True):
         try:
             full = (["sudo","-A","-H","-iu", login_user] + argv) if login_user else argv
@@ -735,29 +757,41 @@ class Updater:
         base = 5
         file_count = sum(1 for ln in files_lines if ln and not ln.startswith("#"))
         return base + file_count
+
     def check_updates(self):
         try:
             from packaging.version import Version
         except Exception:
             return
         latest_ver, latest_tag = self._latest_version_from_github()
-        if not latest_ver or not latest_tag: return
-        try:
-            cur = Version(Globals.VERSION)
-        except Exception:
-            return
-        if latest_ver <= cur: return
-        want = self.ui.ask("Update Available", f"New version {latest_ver} found. Update now?")
-        if not want: return
-        title = f"Updating to {latest_tag}"
-        self.ui.progress_open(title, total_steps=10)
-        self.ui.progress_log(f"Fetching manifest from {self.cfg.update_url} …")
         owner, repo = self._parse_repo()
         if not owner:
-            self.ui.progress_log("Invalid update URL.")
-            self.ui.progress_close()
             return
-        raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{latest_tag}"
+
+        if latest_ver and latest_tag:
+            try:
+                cur = Version(Globals.VERSION)
+            except Exception:
+                cur = None
+            if cur is not None and latest_ver <= cur:
+                return
+            ref = latest_tag
+            label = latest_tag
+        else:
+            try:
+                meta = json.loads(self._http_get(f"https://api.github.com/repos/{owner}/{repo}").decode("utf-8"))
+                ref = meta.get("default_branch") or "main"
+            except Exception:
+                ref = "main"
+            label = f"branch {ref}"
+
+        want = self.ui.ask("Update Available", f"Update from {Globals.VERSION} to {label}?")
+        if not want:
+            return
+        self.ui.progress_open(f"Updating to {label}", total_steps=10)
+        self.ui.progress_log(f"resolving {label}")
+        raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}"
+        self.ui.progress_log(f"raw base: {raw_base}")
         step = 0
         self.ui.progress_set(step, "Downloading requirements.txt")
         req_txt = None
@@ -770,18 +804,25 @@ class Updater:
         self.ui.progress_set(step, "Installing pip requirements")
         if req_txt:
             with tempfile.NamedTemporaryFile("w", delete=False) as tf:
-                tf.write(req_txt); tf.flush()
+                tf.write(req_txt)
+                tf.flush()
                 rc = self.run_cmd([sys.executable, "-m", "pip", "install", "-r", tf.name])
-                try: os.unlink(tf.name)
-                except Exception: pass
-                if rc != 0: self.ui.progress_log("pip install reported errors")
+                try:
+                    os.unlink(tf.name)
+                except Exception:
+                    pass
+                if rc != 0:
+                    self.ui.progress_log("pip install reported errors")
         step += 1
         self.ui.progress_set(step, "Downloading files.txt")
+        files_url = raw_base + "/files.txt"
         try:
-            files_txt = self._download_text(raw_base + "/files.txt")
+            files_txt = self._download_text(files_url)
+            if not files_txt.strip():
+                raise RuntimeError("empty files.txt")
             self.ui.progress_log("files.txt downloaded")
         except Exception:
-            self.ui.progress_log("files.txt missing; update cannot proceed")
+            self.ui.progress_log(f"files.txt missing at {files_url}; update cannot proceed")
             self.ui.progress_close()
             return
         lines = [ln.strip() for ln in files_txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
@@ -789,7 +830,7 @@ class Updater:
         self.ui.progress_set(step, f"Preparing ({step}/{total})")
         step += 1
         self.ui.progress_set(step, "Saving files.txt")
-        uid, gid, mode = self.cfg.owner()
+        uid, gid, _mode = self.cfg.owner()
         self.g.mkdirs(os.path.dirname(self.g.files_txt_path), self.su)
         self.cfg.write(self.g.files_txt_path, files_txt.encode("utf-8"), 0o644, uid, gid, self.su)
         removed_keys_pending = []
@@ -801,12 +842,17 @@ class Updater:
             except ValueError:
                 continue
             rel = path.strip().lstrip("/")
-            repo_file_url = f"{raw_base}/{rel}"
-            dst_path = os.path.join(self.g.install_prefix, rel)
-            self.g.mkdirs(os.path.dirname(dst_path), self.su)
+            url = f"{raw_base}/{rel}"
+            dst = os.path.join(self.g.install_prefix, rel)
+            self.g.mkdirs(os.path.dirname(dst), self.su)
             self.ui.progress_set(step, f"Downloading {rel}")
             try:
-                data = self._download_bytes(repo_file_url)
+                data = self._download_bytes(url)
+                if not data:
+                    raise RuntimeError("empty file")
+                head = data[:200].lstrip()
+                if head.startswith(b"<!DOCTYPE ") or head.startswith(b"<html"):
+                    raise RuntimeError("html response")
             except Exception as e:
                 self.ui.progress_log(f"download failed for {rel}: {e}")
                 continue
@@ -823,21 +869,20 @@ class Updater:
                     updated_txt = self.cfg.append_new(current_txt, default_dict, existing_dict)
                     self.cfg.write(self.g.env_path, updated_txt.encode("utf-8"), 0o644, uid, gid, self.su)
                     removed = [k for k in existing_dict.keys() if k not in default_dict]
-                    if removed: removed_keys_pending.extend(removed)
+                    if removed:
+                        removed_keys_pending.extend(removed)
                     self.ui.progress_log("merged new env keys from upstream")
                 step += 1
                 continue
-            existing_mode = None
-            if os.path.exists(dst_path):
-                st = os.stat(dst_path)
+            if os.path.exists(dst):
+                st = os.stat(dst)
                 f_uid, f_gid = st.st_uid, st.st_gid
-                existing_mode = st.st_mode & 0o777
             else:
                 f_uid, f_gid = uid, gid
-            mode_out = 0o755 if flag[0] == 'x' else 0o644
-            if existing_mode is not None:
-                mode_out = existing_mode & 0o777
-            self.cfg.write(dst_path, data, mode_out, f_uid, f_gid, self.su)
+            mode_out = 0o755 if (flag and flag[0] == "x") else 0o644
+            if rel in ("bin/sush", "bin/sush-askpass"):
+                mode_out = 0o755
+            self.cfg.write(dst, data, mode_out, f_uid, f_gid, self.su)
             self.ui.progress_log(f"installed {rel}")
             step += 1
             self.ui.progress_set(step, f"Installed {rel} ({step}/{total})")
@@ -858,8 +903,9 @@ class Updater:
         restart = self.ui.ask("Update", "Restart sush now?")
         self.ui.progress_close()
         if restart:
+            bin_path = getattr(self.g, "bin_sush_path", None) or self.g.script_path
             curses.endwin()
-            os.execv(sys.executable, [sys.executable, self.g.script_path])
+            os.execv(bin_path, [bin_path])
 
 def main(stdscr):
     g = Globals()
